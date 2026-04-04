@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { BillingType } from "@paperclipai/shared";
+import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
   agents,
   agentRuntimeState,
@@ -10,6 +12,7 @@ import {
   agentWakeupRequests,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   projects,
   projectWorkspaces,
@@ -23,32 +26,57 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
+import { getTelemetryClient } from "../telemetry.js";
+import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
-import { summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
+import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { buildHeartbeatRunIssueComment, summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
 import {
   buildWorkspaceReadyComment,
+  cleanupExecutionWorkspaceArtifacts,
   ensureRuntimeServicesForRun,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  type ExecutionWorkspaceInput,
+  type RealizedExecutionWorkspace,
+  sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { workspaceOperationService } from "./workspace-operations.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
+  gateProjectExecutionWorkspacePolicy,
+  issueExecutionWorkspaceModeForPersistedWorkspace,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import {
+  hasSessionCompactionThresholds,
+  resolveSessionCompactionPolicy,
+  type SessionCompactionPolicy,
+} from "@paperclipai/adapter-utils";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
+const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
+const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
+const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_INLINE_WAKE_COMMENTS = 8;
+const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
+const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const execFile = promisify(execFileCallback);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -57,6 +85,151 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+
+export function applyPersistedExecutionWorkspaceConfig(input: {
+  config: Record<string, unknown>;
+  workspaceConfig: ExecutionWorkspaceConfig | null;
+  mode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+}) {
+  const nextConfig = { ...input.config };
+
+  if (input.mode !== "agent_default") {
+    if (input.workspaceConfig?.workspaceRuntime === null) {
+      delete nextConfig.workspaceRuntime;
+    } else if (input.workspaceConfig?.workspaceRuntime) {
+      nextConfig.workspaceRuntime = { ...input.workspaceConfig.workspaceRuntime };
+    }
+  }
+
+  if (input.workspaceConfig && input.mode === "isolated_workspace") {
+    const nextStrategy = parseObject(nextConfig.workspaceStrategy);
+    if (input.workspaceConfig.provisionCommand === null) delete nextStrategy.provisionCommand;
+    else nextStrategy.provisionCommand = input.workspaceConfig.provisionCommand;
+    if (input.workspaceConfig.teardownCommand === null) delete nextStrategy.teardownCommand;
+    else nextStrategy.teardownCommand = input.workspaceConfig.teardownCommand;
+    nextConfig.workspaceStrategy = nextStrategy;
+  }
+
+  return nextConfig;
+}
+
+export function stripWorkspaceRuntimeFromExecutionRunConfig(config: Record<string, unknown>) {
+  const nextConfig = { ...config };
+  delete nextConfig.workspaceRuntime;
+  return nextConfig;
+}
+
+export function buildRealizedExecutionWorkspaceFromPersisted(input: {
+  base: ExecutionWorkspaceInput;
+  workspace: ExecutionWorkspace;
+}): RealizedExecutionWorkspace | null {
+  const cwd = readNonEmptyString(input.workspace.cwd) ?? readNonEmptyString(input.workspace.providerRef);
+  if (!cwd) {
+    return null;
+  }
+
+  const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
+  return {
+    baseCwd: input.base.baseCwd,
+    source: input.workspace.mode === "shared_workspace" ? "project_primary" : "task_session",
+    projectId: input.workspace.projectId ?? input.base.projectId,
+    workspaceId: input.workspace.projectWorkspaceId ?? input.base.workspaceId,
+    repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
+    repoRef: input.workspace.baseRef ?? input.base.repoRef,
+    strategy,
+    cwd,
+    branchName: input.workspace.branchName ?? null,
+    worktreePath: strategy === "git_worktree" ? (readNonEmptyString(input.workspace.providerRef) ?? cwd) : null,
+    warnings: [],
+    created: false,
+  };
+}
+
+function buildExecutionWorkspaceConfigSnapshot(config: Record<string, unknown>): Partial<ExecutionWorkspaceConfig> | null {
+  const strategy = parseObject(config.workspaceStrategy);
+  const snapshot: Partial<ExecutionWorkspaceConfig> = {};
+
+  if ("workspaceStrategy" in config) {
+    snapshot.provisionCommand = typeof strategy.provisionCommand === "string" ? strategy.provisionCommand : null;
+    snapshot.teardownCommand = typeof strategy.teardownCommand === "string" ? strategy.teardownCommand : null;
+  }
+
+  if ("workspaceRuntime" in config) {
+    const workspaceRuntime = parseObject(config.workspaceRuntime);
+    snapshot.workspaceRuntime = Object.keys(workspaceRuntime).length > 0 ? workspaceRuntime : null;
+  }
+
+  const hasSnapshot = Object.values(snapshot).some((value) => {
+    if (value === null) return false;
+    if (typeof value === "object") return Object.keys(value).length > 0;
+    return true;
+  });
+  return hasSnapshot ? snapshot : null;
+}
+
+function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
+  const trimmed = repoUrl?.trim() ?? "";
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const cleanedPath = parsed.pathname.replace(/\/+$/, "");
+    const repoName = cleanedPath.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? "";
+    return repoName || null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureManagedProjectWorkspace(input: {
+  companyId: string;
+  projectId: string;
+  repoUrl: string | null;
+}): Promise<{ cwd: string; warning: string | null }> {
+  const cwd = resolveManagedProjectWorkspaceDir({
+    companyId: input.companyId,
+    projectId: input.projectId,
+    repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
+  });
+  await fs.mkdir(path.dirname(cwd), { recursive: true });
+  const stats = await fs.stat(cwd).catch(() => null);
+
+  if (!input.repoUrl) {
+    if (!stats) {
+      await fs.mkdir(cwd, { recursive: true });
+    }
+    return { cwd, warning: null };
+  }
+
+  const gitDirExists = await fs
+    .stat(path.resolve(cwd, ".git"))
+    .then((entry) => entry.isDirectory())
+    .catch(() => false);
+  if (gitDirExists) {
+    return { cwd, warning: null };
+  }
+
+  if (stats) {
+    const entries = await fs.readdir(cwd).catch(() => []);
+    if (entries.length > 0) {
+      return {
+        cwd,
+        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
+      };
+    }
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+
+  try {
+    await execFile("git", ["clone", input.repoUrl, cwd], {
+      env: sanitizeRuntimeServiceBaseEnv(process.env),
+      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+    });
+    return { cwd, warning: null };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+  }
+}
 
 const heartbeatRunListColumns = {
   id: heartbeatRuns.id,
@@ -84,6 +257,10 @@ const heartbeatRunListColumns = {
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
   errorCode: heartbeatRuns.errorCode,
   externalRunId: heartbeatRuns.externalRunId,
+  processPid: heartbeatRuns.processPid,
+  processStartedAt: heartbeatRuns.processStartedAt,
+  retryOfRunId: heartbeatRuns.retryOfRunId,
+  processLossRetryCount: heartbeatRuns.processLossRetryCount,
   contextSnapshot: heartbeatRuns.contextSnapshot,
   createdAt: heartbeatRuns.createdAt,
   updatedAt: heartbeatRuns.updatedAt,
@@ -133,13 +310,6 @@ type UsageTotals = {
   outputTokens: number;
 };
 
-type SessionCompactionPolicy = {
-  enabled: boolean;
-  maxSessionRuns: number;
-  maxRawInputTokens: number;
-  maxSessionAgeHours: number;
-};
-
 type SessionCompactionDecision = {
   rotate: boolean;
   reason: string | null;
@@ -167,6 +337,20 @@ export type ResolvedWorkspaceForRun = {
   }>;
   warnings: string[];
 };
+
+type ProjectWorkspaceCandidate = {
+  id: string;
+};
+
+export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
+  rows: T[],
+  preferredWorkspaceId: string | null | undefined,
+): T[] {
+  if (!preferredWorkspaceId) return rows;
+  const preferredIndex = rows.findIndex((row) => row.id === preferredWorkspaceId);
+  if (preferredIndex <= 0) return rows;
+  return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
+}
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -233,6 +417,51 @@ async function resolveLedgerScopeForRun(
   };
 }
 
+type ResumeSessionRow = {
+  sessionParamsJson: Record<string, unknown> | null;
+  sessionDisplayId: string | null;
+  lastRunId: string | null;
+};
+
+export function buildExplicitResumeSessionOverride(input: {
+  resumeFromRunId: string;
+  resumeRunSessionIdBefore: string | null;
+  resumeRunSessionIdAfter: string | null;
+  taskSession: ResumeSessionRow | null;
+  sessionCodec: AdapterSessionCodec;
+}) {
+  const desiredDisplayId = truncateDisplayId(
+    input.resumeRunSessionIdAfter ?? input.resumeRunSessionIdBefore,
+  );
+  const taskSessionParams = normalizeSessionParams(
+    input.sessionCodec.deserialize(input.taskSession?.sessionParamsJson ?? null),
+  );
+  const taskSessionDisplayId = truncateDisplayId(
+    input.taskSession?.sessionDisplayId ??
+      (input.sessionCodec.getDisplayId ? input.sessionCodec.getDisplayId(taskSessionParams) : null) ??
+      readNonEmptyString(taskSessionParams?.sessionId),
+  );
+  const canReuseTaskSessionParams =
+    input.taskSession != null &&
+    (
+      input.taskSession.lastRunId === input.resumeFromRunId ||
+      (!!desiredDisplayId && taskSessionDisplayId === desiredDisplayId)
+    );
+  const sessionParams =
+    canReuseTaskSessionParams
+      ? taskSessionParams
+      : desiredDisplayId
+        ? { sessionId: desiredDisplayId }
+        : null;
+  const sessionDisplayId = desiredDisplayId ?? (canReuseTaskSessionParams ? taskSessionDisplayId : null);
+
+  if (!sessionDisplayId && !sessionParams) return null;
+  return {
+    sessionDisplayId,
+    sessionParams,
+  };
+}
+
 function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTotals | null {
   if (!usage) return null;
   return {
@@ -296,23 +525,8 @@ function formatCount(value: number | null | undefined) {
   return value.toLocaleString("en-US");
 }
 
-function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
-  const runtimeConfig = parseObject(agent.runtimeConfig);
-  const heartbeat = parseObject(runtimeConfig.heartbeat);
-  const compaction = parseObject(
-    heartbeat.sessionCompaction ?? heartbeat.sessionRotation ?? runtimeConfig.sessionCompaction,
-  );
-  const supportsSessions = SESSIONED_LOCAL_ADAPTERS.has(agent.adapterType);
-  const enabled = compaction.enabled === undefined
-    ? supportsSessions
-    : asBoolean(compaction.enabled, supportsSessions);
-
-  return {
-    enabled,
-    maxSessionRuns: Math.max(0, Math.floor(asNumber(compaction.maxSessionRuns, 200))),
-    maxRawInputTokens: Math.max(0, Math.floor(asNumber(compaction.maxRawInputTokens, 2_000_000))),
-    maxSessionAgeHours: Math.max(0, Math.floor(asNumber(compaction.maxSessionAgeHours, 72))),
-  };
+export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
+  return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
@@ -401,6 +615,14 @@ function parseIssueAssigneeAdapterOverrides(
   };
 }
 
+/**
+ * Synthetic task key for timer/heartbeat wakes that have no issue context.
+ * This allows timer wakes to participate in the `agentTaskSessions` system
+ * and benefit from robust session resume, instead of relying solely on the
+ * simpler `agentRuntimeState.sessionId` fallback.
+ */
+const HEARTBEAT_TASK_KEY = "__heartbeat__";
+
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
@@ -416,6 +638,28 @@ function deriveTaskKey(
   );
 }
 
+/**
+ * Extended task key derivation that falls back to a stable synthetic key
+ * for timer/heartbeat wakes. This ensures timer wakes can resume their
+ * previous session via `agentTaskSessions` instead of starting fresh.
+ *
+ * The synthetic key is only used when:
+ * - No explicit task/issue key exists in the context
+ * - The wake source is "timer" (scheduled heartbeat)
+ */
+export function deriveTaskKeyWithHeartbeatFallback(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  payload: Record<string, unknown> | null | undefined,
+) {
+  const explicit = deriveTaskKey(contextSnapshot, payload);
+  if (explicit) return explicit;
+
+  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
+  if (wakeSource === "timer") return HEARTBEAT_TASK_KEY;
+
+  return null;
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -424,6 +668,13 @@ export function shouldResetTaskSessionForWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return true;
   return false;
+}
+
+export function formatRuntimeWorkspaceWarningLog(warning: string) {
+  return {
+    stream: "stdout" as const,
+    chunk: `[paperclip] ${warning}\n`,
+  };
 }
 
 function describeSessionResetReason(
@@ -440,12 +691,58 @@ function deriveCommentId(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
 ) {
+  const batchedCommentId = extractWakeCommentIds(contextSnapshot).at(-1);
   return (
+    batchedCommentId ??
     readNonEmptyString(contextSnapshot?.wakeCommentId) ??
     readNonEmptyString(contextSnapshot?.commentId) ??
     readNonEmptyString(payload?.commentId) ??
     null
   );
+}
+
+export function extractWakeCommentIds(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): string[] {
+  const raw = contextSnapshot?.[WAKE_COMMENT_IDS_KEY];
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const entry of raw) {
+    const value = readNonEmptyString(entry);
+    if (!value || out.includes(value)) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+function mergeWakeCommentIds(...values: Array<unknown>): string[] {
+  const merged: string[] = [];
+  const append = (value: unknown) => {
+    const normalized = readNonEmptyString(value);
+    if (!normalized || merged.includes(normalized)) return;
+    merged.push(normalized);
+  };
+
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      for (const entry of value) append(entry);
+      continue;
+    }
+    if (typeof value === "object" && value !== null) {
+      const candidate = value as Record<string, unknown>;
+      const batched = extractWakeCommentIds(candidate);
+      if (batched.length > 0) {
+        for (const entry of batched) append(entry);
+        continue;
+      }
+      append(candidate.wakeCommentId);
+      append(candidate.commentId);
+      continue;
+    }
+    append(value);
+  }
+
+  return merged;
 }
 
 function enrichWakeContextSnapshot(input: {
@@ -460,6 +757,7 @@ function enrichWakeContextSnapshot(input: {
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentId = deriveCommentId(contextSnapshot, payload);
+  const wakeCommentIds = mergeWakeCommentIds(contextSnapshot, commentIdFromPayload);
 
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
@@ -476,7 +774,15 @@ function enrichWakeContextSnapshot(input: {
   if (!readNonEmptyString(contextSnapshot["commentId"]) && commentIdFromPayload) {
     contextSnapshot.commentId = commentIdFromPayload;
   }
-  if (!readNonEmptyString(contextSnapshot["wakeCommentId"]) && wakeCommentId) {
+  if (wakeCommentIds.length > 0) {
+    const latestCommentId = wakeCommentIds[wakeCommentIds.length - 1];
+    contextSnapshot[WAKE_COMMENT_IDS_KEY] = wakeCommentIds;
+    contextSnapshot.commentId = latestCommentId;
+    contextSnapshot.wakeCommentId = latestCommentId;
+    // Once comment ids are normalized into the snapshot, rebuild the structured
+    // wake payload from those ids later instead of carrying forward stale data.
+    delete contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  } else if (!readNonEmptyString(contextSnapshot["wakeCommentId"]) && wakeCommentId) {
     contextSnapshot.wakeCommentId = wakeCommentId;
   }
   if (!readNonEmptyString(contextSnapshot["wakeSource"]) && source) {
@@ -495,7 +801,7 @@ function enrichWakeContextSnapshot(input: {
   };
 }
 
-function mergeCoalescedContextSnapshot(
+export function mergeCoalescedContextSnapshot(
   existingRaw: unknown,
   incoming: Record<string, unknown>,
 ) {
@@ -504,12 +810,136 @@ function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
-  const commentId = deriveCommentId(incoming, null);
-  if (commentId) {
-    merged.commentId = commentId;
-    merged.wakeCommentId = commentId;
+  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
+  if (mergedCommentIds.length > 0) {
+    const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
+    merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
+    merged.commentId = latestCommentId;
+    merged.wakeCommentId = latestCommentId;
+    // The merged context should carry canonical comment ids; the next wake will
+    // regenerate any structured payload from those ids.
+    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   return merged;
+}
+
+async function buildPaperclipWakePayload(input: {
+  db: Db;
+  companyId: string;
+  contextSnapshot: Record<string, unknown>;
+  issueSummary?:
+    | {
+        id: string;
+        identifier: string | null;
+        title: string;
+        status: string;
+        priority: string;
+      }
+    | null;
+}) {
+  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  if (commentIds.length === 0) return null;
+
+  const issueId = readNonEmptyString(input.contextSnapshot.issueId);
+  const issueSummary =
+    input.issueSummary ??
+    (issueId
+      ? await input.db
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            priority: issues.priority,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
+          .then((rows) => rows[0] ?? null)
+      : null);
+
+  const commentRows = await input.db
+    .select({
+      id: issueComments.id,
+      issueId: issueComments.issueId,
+      body: issueComments.body,
+      authorAgentId: issueComments.authorAgentId,
+      authorUserId: issueComments.authorUserId,
+      createdAt: issueComments.createdAt,
+    })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, input.companyId),
+        inArray(issueComments.id, commentIds),
+      ),
+    );
+
+  const commentsById = new Map(commentRows.map((comment) => [comment.id, comment]));
+  const comments: Array<Record<string, unknown>> = [];
+  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
+  let truncated = false;
+  let missingCommentCount = 0;
+
+  for (const commentId of commentIds) {
+    const row = commentsById.get(commentId);
+    if (!row) {
+      truncated = true;
+      missingCommentCount += 1;
+      continue;
+    }
+    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
+      truncated = true;
+      break;
+    }
+
+    const fullBody = row.body;
+    const allowedBodyChars = Math.min(MAX_INLINE_WAKE_COMMENT_BODY_CHARS, remainingBodyChars);
+    if (allowedBodyChars <= 0) {
+      truncated = true;
+      break;
+    }
+
+    const body = fullBody.length > allowedBodyChars ? fullBody.slice(0, allowedBodyChars) : fullBody;
+    const bodyTruncated = body.length < fullBody.length;
+    if (bodyTruncated) truncated = true;
+    remainingBodyChars -= body.length;
+
+    comments.push({
+      id: row.id,
+      issueId: row.issueId,
+      body,
+      bodyTruncated,
+      createdAt: row.createdAt.toISOString(),
+      author: row.authorAgentId
+        ? { type: "agent", id: row.authorAgentId }
+        : row.authorUserId
+          ? { type: "user", id: row.authorUserId }
+          : { type: "system", id: null },
+    });
+  }
+
+  return {
+    reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    issue: issueSummary
+      ? {
+          id: issueSummary.id,
+          identifier: issueSummary.identifier,
+          title: issueSummary.title,
+          status: issueSummary.status,
+          priority: issueSummary.priority,
+        }
+      : null,
+    commentIds,
+    latestCommentId: commentIds[commentIds.length - 1] ?? null,
+    comments,
+    commentWindow: {
+      requestedCount: commentIds.length,
+      includedCount: comments.length,
+      missingCount: missingCommentCount,
+    },
+    truncated,
+    fallbackFetchNeeded: truncated || missingCommentCount > 0,
+  };
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -518,6 +948,26 @@ function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
 
 function isSameTaskScope(left: string | null, right: string | null) {
   return (left ?? null) === (right ?? null);
+}
+
+function isTrackedLocalChildProcessAdapter(adapterType: string) {
+  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+}
+
+// A positive liveness check means some process currently owns the PID.
+// On Linux, PIDs can be recycled, so this is a best-effort signal rather
+// than proof that the original child is still alive.
+function isProcessAlive(pid: number | null | undefined) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    return false;
+  }
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -616,9 +1066,17 @@ function resolveNextSessionState(input: {
 }
 
 export function heartbeatService(db: Db) {
+  const instanceSettings = instanceSettingsService(db);
+  const getCurrentUserRedactionOptions = async () => ({
+    enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+  });
+
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
+  const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db);
+  const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
@@ -743,7 +1201,7 @@ export function heartbeatService(db: Db) {
     }
 
     const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled) {
+    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
       return {
         rotate: false,
         reason: null,
@@ -865,6 +1323,57 @@ export function heartbeatService(db: Db) {
     return runtimeForRun?.sessionId ?? null;
   }
 
+  async function resolveExplicitResumeSessionOverride(
+    agent: typeof agents.$inferSelect,
+    payload: Record<string, unknown> | null,
+    taskKey: string | null,
+  ) {
+    const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
+    if (!resumeFromRunId) return null;
+
+    const resumeRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
+        sessionIdAfter: heartbeatRuns.sessionIdAfter,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, resumeFromRunId),
+          eq(heartbeatRuns.companyId, agent.companyId),
+          eq(heartbeatRuns.agentId, agent.id),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!resumeRun) return null;
+
+    const resumeContext = parseObject(resumeRun.contextSnapshot);
+    const resumeTaskKey = deriveTaskKey(resumeContext, null) ?? taskKey;
+    const resumeTaskSession = resumeTaskKey
+      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
+      : null;
+    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
+    const sessionOverride = buildExplicitResumeSessionOverride({
+      resumeFromRunId,
+      resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
+      resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
+      taskSession: resumeTaskSession,
+      sessionCodec,
+    });
+    if (!sessionOverride) return null;
+
+    return {
+      resumeFromRunId,
+      taskKey: resumeTaskKey,
+      issueId: readNonEmptyString(resumeContext.issueId),
+      taskId: readNonEmptyString(resumeContext.taskId) ?? readNonEmptyString(resumeContext.issueId),
+      sessionDisplayId: sessionOverride.sessionDisplayId,
+      sessionParams: sessionOverride.sessionParams,
+    };
+  }
+
   async function resolveWorkspaceForRun(
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
@@ -873,18 +1382,25 @@ export function heartbeatService(db: Db) {
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId);
     const contextProjectId = readNonEmptyString(context.projectId);
-    const issueProjectId = issueId
+    const contextProjectWorkspaceId = readNonEmptyString(context.projectWorkspaceId);
+    const issueProjectRef = issueId
       ? await db
-          .select({ projectId: issues.projectId })
+          .select({
+            projectId: issues.projectId,
+            projectWorkspaceId: issues.projectWorkspaceId,
+          })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-          .then((rows) => rows[0]?.projectId ?? null)
+          .then((rows) => rows[0] ?? null)
       : null;
+    const issueProjectId = issueProjectRef?.projectId ?? null;
+    const preferredProjectWorkspaceId =
+      issueProjectRef?.projectWorkspaceId ?? contextProjectWorkspaceId ?? null;
     const resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
-    const projectWorkspaceRows = workspaceProjectId
+    const unorderedProjectWorkspaceRows = workspaceProjectId
       ? await db
           .select()
           .from(projectWorkspaces)
@@ -896,6 +1412,10 @@ export function heartbeatService(db: Db) {
           )
           .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
       : [];
+    const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
+      unorderedProjectWorkspaceRows,
+      preferredProjectWorkspaceId,
+    );
 
     const workspaceHints = projectWorkspaceRows.map((workspace) => ({
       workspaceId: workspace.id,
@@ -905,12 +1425,34 @@ export function heartbeatService(db: Db) {
     }));
 
     if (projectWorkspaceRows.length > 0) {
+      const preferredWorkspace = preferredProjectWorkspaceId
+        ? projectWorkspaceRows.find((workspace) => workspace.id === preferredProjectWorkspaceId) ?? null
+        : null;
       const missingProjectCwds: string[] = [];
       let hasConfiguredProjectCwd = false;
+      let preferredWorkspaceWarning: string | null = null;
+      if (preferredProjectWorkspaceId && !preferredWorkspace) {
+        preferredWorkspaceWarning =
+          `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
+      }
       for (const workspace of projectWorkspaceRows) {
-        const projectCwd = readNonEmptyString(workspace.cwd);
+        let projectCwd = readNonEmptyString(workspace.cwd);
+        let managedWorkspaceWarning: string | null = null;
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
-          continue;
+          try {
+            const managedWorkspace = await ensureManagedProjectWorkspace({
+              companyId: agent.companyId,
+              projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
+              repoUrl: readNonEmptyString(workspace.repoUrl),
+            });
+            projectCwd = managedWorkspace.cwd;
+            managedWorkspaceWarning = managedWorkspace.warning;
+          } catch (error) {
+            if (preferredWorkspace?.id === workspace.id) {
+              preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+            }
+            continue;
+          }
         }
         hasConfiguredProjectCwd = true;
         const projectCwdExists = await fs
@@ -926,8 +1468,14 @@ export function heartbeatService(db: Db) {
             repoUrl: workspace.repoUrl,
             repoRef: workspace.repoRef,
             workspaceHints,
-            warnings: [],
+            warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
+              (value): value is string => Boolean(value),
+            ),
           };
+        }
+        if (preferredWorkspace?.id === workspace.id) {
+          preferredWorkspaceWarning =
+            `Selected project workspace path "${projectCwd}" is not available yet.`;
         }
         missingProjectCwds.push(projectCwd);
       }
@@ -935,6 +1483,9 @@ export function heartbeatService(db: Db) {
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings: string[] = [];
+      if (preferredWorkspaceWarning) {
+        warnings.push(preferredWorkspaceWarning);
+      }
       if (missingProjectCwds.length > 0) {
         const firstMissing = missingProjectCwds[0];
         const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
@@ -957,6 +1508,24 @@ export function heartbeatService(db: Db) {
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
         workspaceHints,
         warnings,
+      };
+    }
+
+    if (workspaceProjectId) {
+      const managedWorkspace = await ensureManagedProjectWorkspace({
+        companyId: agent.companyId,
+        projectId: workspaceProjectId,
+        repoUrl: null,
+      });
+      return {
+        cwd: managedWorkspace.cwd,
+        source: "project_primary" as const,
+        projectId: resolvedProjectId,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        workspaceHints,
+        warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
       };
     }
 
@@ -1151,8 +1720,13 @@ export function heartbeatService(db: Db) {
       payload?: Record<string, unknown>;
     },
   ) {
-    const sanitizedMessage = event.message ? redactCurrentUserText(event.message) : event.message;
-    const sanitizedPayload = event.payload ? redactCurrentUserValue(event.payload) : event.payload;
+    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+    const sanitizedMessage = event.message
+      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      : event.message;
+    const sanitizedPayload = event.payload
+      ? redactCurrentUserValue(event.payload, currentUserRedactionOptions)
+      : event.payload;
 
     await db.insert(heartbeatRunEvents).values({
       companyId: run.companyId,
@@ -1182,6 +1756,156 @@ export function heartbeatService(db: Db) {
         payload: sanitizedPayload ?? null,
       },
     });
+  }
+
+  async function nextRunEventSeq(runId: string) {
+    const [row] = await db
+      .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    return Number(row?.maxSeq ?? 0) + 1;
+  }
+
+  async function persistRunProcessMetadata(
+    runId: string,
+    meta: { pid: number; startedAt: string },
+  ) {
+    const startedAt = new Date(meta.startedAt);
+    return db
+      .update(heartbeatRuns)
+      .set({
+        processPid: meta.pid,
+        processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function clearDetachedRunWarning(runId: string) {
+    const updated = await db
+      .update(heartbeatRuns)
+      .set({
+        error: null,
+        errorCode: null,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.errorCode, DETACHED_PROCESS_ERROR_CODE)))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) return null;
+
+    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Detached child process reported activity; cleared detached warning",
+    });
+    return updated;
+  }
+
+  async function enqueueProcessLossRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const retryContextSnapshot = {
+      ...contextSnapshot,
+      retryOfRunId: run.id,
+      wakeReason: "process_lost_retry",
+      retryReason: "process_lost",
+    };
+
+    const queued = await db.transaction(async (tx) => {
+      const wakeupRequest = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "process_lost_retry",
+          payload: {
+            ...(issueId ? { issueId } : {}),
+            retryOfRunId: run.id,
+          },
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const retryRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeupRequest.id,
+          contextSnapshot: retryContextSnapshot,
+          sessionIdBefore: sessionBefore,
+          retryOfRunId: run.id,
+          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          runId: retryRun.id,
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: retryRun.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+      }
+
+      return retryRun;
+    });
+
+    publishLiveEvent({
+      companyId: queued.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.id,
+        agentId: queued.agentId,
+        invocationSource: queued.invocationSource,
+        triggerDetail: queued.triggerDetail,
+        wakeupRequestId: queued.wakeupRequestId,
+      },
+    });
+
+    await appendRunEvent(queued, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Queued automatic retry after orphaned child process was confirmed dead",
+      payload: {
+        retryOfRunId: run.id,
+      },
+    });
+
+    return queued;
   }
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -1270,6 +1994,8 @@ export function heartbeatService(db: Db) {
       return;
     }
 
+    const isFirstHeartbeat = !existing.lastHeartbeatAt;
+
     const runningCount = await countRunningRunsForAgent(agentId);
     const nextStatus =
       runningCount > 0
@@ -1288,6 +2014,11 @@ export function heartbeatService(db: Db) {
       .where(eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    if (isFirstHeartbeat && updated) {
+      const tc = getTelemetryClient();
+      if (tc) trackAgentFirstHeartbeat(tc, { agentRole: updated.role });
+    }
 
     if (updated) {
       publishLiveEvent({
@@ -1311,13 +2042,17 @@ export function heartbeatService(db: Db) {
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
-      .select()
+      .select({
+        run: heartbeatRuns,
+        adapterType: agents.adapterType,
+      })
       .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
 
     const reaped: string[] = [];
 
-    for (const run of activeRuns) {
+    for (const { run, adapterType } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -1326,25 +2061,69 @@ export function heartbeatService(db: Db) {
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      await setRunStatus(run.id, "failed", {
-        error: "Process lost -- server may have restarted",
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) {
+        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+          const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
+          const detachedRun = await setRunStatus(run.id, "running", {
+            error: detachedMessage,
+            errorCode: DETACHED_PROCESS_ERROR_CODE,
+          });
+          if (detachedRun) {
+            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: detachedMessage,
+              payload: {
+                processPid: run.processPid,
+              },
+            });
+          }
+        }
+        continue;
+      }
+
+      const shouldRetry = tracksLocalChild && !!run.processPid && (run.processLossRetryCount ?? 0) < 1;
+      const baseMessage = run.processPid
+        ? `Process lost -- child pid ${run.processPid} is no longer running`
+        : "Process lost -- server may have restarted";
+
+      let finalizedRun = await setRunStatus(run.id, "failed", {
+        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: "Process lost -- server may have restarted",
+        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      const updatedRun = await getRun(run.id);
-      if (updatedRun) {
-        await appendRunEvent(updatedRun, 1, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "error",
-          message: "Process lost -- server may have restarted",
-        });
-        await releaseIssueExecutionAndPromote(updatedRun);
+      if (!finalizedRun) finalizedRun = await getRun(run.id);
+      if (!finalizedRun) continue;
+
+      let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      if (shouldRetry) {
+        const agent = await getAgent(run.agentId);
+        if (agent) {
+          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+        }
+      } else {
+        await releaseIssueExecutionAndPromote(finalizedRun);
       }
+
+      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "error",
+        message: shouldRetry
+          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+          : baseMessage,
+        payload: {
+          ...(run.processPid ? { processPid: run.processPid } : {}),
+          ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+        },
+      });
+
       await finalizeAgentStatus(run.agentId, "failed");
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
@@ -1495,13 +2274,21 @@ export function heartbeatService(db: Db) {
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const taskKey = deriveTaskKey(context, null);
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
-    const issueAssigneeConfig = issueId
+    const issueContext = issueId
       ? await db
           .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            priority: issues.priority,
             projectId: issues.projectId,
+            projectWorkspaceId: issues.projectWorkspaceId,
+            executionWorkspaceId: issues.executionWorkspaceId,
+            executionWorkspacePreference: issues.executionWorkspacePreference,
             assigneeAgentId: issues.assigneeAgentId,
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
@@ -1511,22 +2298,27 @@ export function heartbeatService(db: Db) {
           .then((rows) => rows[0] ?? null)
       : null;
     const issueAssigneeOverrides =
-      issueAssigneeConfig && issueAssigneeConfig.assigneeAgentId === agent.id
+      issueContext && issueContext.assigneeAgentId === agent.id
         ? parseIssueAssigneeAdapterOverrides(
-            issueAssigneeConfig.assigneeAdapterOverrides,
+            issueContext.assigneeAdapterOverrides,
           )
         : null;
-    const issueExecutionWorkspaceSettings = parseIssueExecutionWorkspaceSettings(
-      issueAssigneeConfig?.executionWorkspaceSettings,
-    );
+    const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+    const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled
+      ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings)
+      : null;
     const contextProjectId = readNonEmptyString(context.projectId);
-    const executionProjectId = issueAssigneeConfig?.projectId ?? contextProjectId;
+    const executionProjectId = issueContext?.projectId ?? contextProjectId;
     const projectExecutionWorkspacePolicy = executionProjectId
       ? await db
           .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
           .from(projects)
           .where(and(eq(projects.id, executionProjectId), eq(projects.companyId, agent.companyId)))
-          .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy))
+          .then((rows) =>
+            gateProjectExecutionWorkspacePolicy(
+              parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy),
+              isolatedWorkspacesEnabled,
+            ))
       : null;
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
@@ -1534,11 +2326,20 @@ export function heartbeatService(db: Db) {
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
     const taskSessionForRun = resetTaskSession ? null : taskSession;
-    const previousSessionParams = normalizeSessionParams(
-      sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+    const explicitResumeSessionParams = normalizeSessionParams(
+      sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
     );
+    const explicitResumeSessionDisplayId = truncateDisplayId(
+      readNonEmptyString(context.resumeSessionDisplayId) ??
+        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
+        readNonEmptyString(explicitResumeSessionParams?.sessionId),
+    );
+    const previousSessionParams =
+      explicitResumeSessionParams ??
+      (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
+      normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
     const config = parseObject(agent.adapterConfig);
-    const executionWorkspaceMode = resolveExecutionWorkspaceMode({
+    const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
@@ -1547,50 +2348,255 @@ export function heartbeatService(db: Db) {
       agent,
       context,
       previousSessionParams,
-      { useProjectWorkspace: executionWorkspaceMode !== "agent_default" },
+      { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
     );
-    const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
-      agentConfig: config,
-      projectPolicy: projectExecutionWorkspacePolicy,
-      issueSettings: issueExecutionWorkspaceSettings,
-      mode: executionWorkspaceMode,
-      legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+    const issueRef = issueContext
+      ? {
+          id: issueContext.id,
+          identifier: issueContext.identifier,
+          title: issueContext.title,
+          status: issueContext.status,
+          priority: issueContext.priority,
+          projectId: issueContext.projectId,
+          projectWorkspaceId: issueContext.projectWorkspaceId,
+          executionWorkspaceId: issueContext.executionWorkspaceId,
+          executionWorkspacePreference: issueContext.executionWorkspacePreference,
+        }
+      : null;
+    const paperclipWakePayload = await buildPaperclipWakePayload({
+      db,
+      companyId: agent.companyId,
+      contextSnapshot: context,
+      issueSummary: issueRef
+        ? {
+            id: issueRef.id,
+            identifier: issueRef.identifier,
+            title: issueRef.title,
+            status: issueRef.status,
+            priority: issueRef.priority,
+          }
+        : null,
+    });
+    if (paperclipWakePayload) {
+      context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
+    } else {
+      delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
+    }
+    const existingExecutionWorkspace =
+      issueRef?.executionWorkspaceId ? await executionWorkspacesSvc.getById(issueRef.executionWorkspaceId) : null;
+    const shouldReuseExisting =
+      issueRef?.executionWorkspacePreference === "reuse_existing" &&
+      existingExecutionWorkspace &&
+      existingExecutionWorkspace.status !== "archived";
+    const persistedExecutionWorkspaceMode = shouldReuseExisting && existingExecutionWorkspace
+      ? issueExecutionWorkspaceModeForPersistedWorkspace(existingExecutionWorkspace.mode)
+      : null;
+    const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
+      persistedExecutionWorkspaceMode === "isolated_workspace" ||
+      persistedExecutionWorkspaceMode === "operator_branch" ||
+      persistedExecutionWorkspaceMode === "agent_default"
+        ? persistedExecutionWorkspaceMode
+        : requestedExecutionWorkspaceMode;
+    const workspaceManagedConfig = shouldReuseExisting
+      ? { ...config }
+      : buildExecutionWorkspaceAdapterConfig({
+          agentConfig: config,
+          projectPolicy: projectExecutionWorkspacePolicy,
+          issueSettings: issueExecutionWorkspaceSettings,
+          mode: requestedExecutionWorkspaceMode,
+          legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+        });
+    const persistedWorkspaceManagedConfig = applyPersistedExecutionWorkspaceConfig({
+      config: workspaceManagedConfig,
+      workspaceConfig: existingExecutionWorkspace?.config ?? null,
+      mode: effectiveExecutionWorkspaceMode,
     });
     const mergedConfig = issueAssigneeOverrides?.adapterConfig
-      ? { ...workspaceManagedConfig, ...issueAssigneeOverrides.adapterConfig }
-      : workspaceManagedConfig;
+      ? { ...persistedWorkspaceManagedConfig, ...issueAssigneeOverrides.adapterConfig }
+      : persistedWorkspaceManagedConfig;
+    const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig);
+    const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
     const { config: resolvedConfig, secretKeys } = await secretsSvc.resolveAdapterConfigForRuntime(
       agent.companyId,
-      mergedConfig,
+      executionRunConfig,
     );
-    const issueRef = issueId
-      ? await db
-          .select({
-            id: issues.id,
-            identifier: issues.identifier,
-            title: issues.title,
-          })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-          .then((rows) => rows[0] ?? null)
-      : null;
-    const executionWorkspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: resolvedWorkspace.cwd,
-        source: resolvedWorkspace.source,
-        projectId: resolvedWorkspace.projectId,
-        workspaceId: resolvedWorkspace.workspaceId,
-        repoUrl: resolvedWorkspace.repoUrl,
-        repoRef: resolvedWorkspace.repoRef,
-      },
-      config: resolvedConfig,
-      issue: issueRef,
-      agent: {
-        id: agent.id,
-        name: agent.name,
-        companyId: agent.companyId,
-      },
+    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
+    const runtimeConfig = {
+      ...resolvedConfig,
+      paperclipRuntimeSkills: runtimeSkillEntries,
+    };
+    const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
+      companyId: agent.companyId,
+      heartbeatRunId: run.id,
+      executionWorkspaceId: existingExecutionWorkspace?.id ?? null,
     });
+    const executionWorkspaceBase = {
+      baseCwd: resolvedWorkspace.cwd,
+      source: resolvedWorkspace.source,
+      projectId: resolvedWorkspace.projectId,
+      workspaceId: resolvedWorkspace.workspaceId,
+      repoUrl: resolvedWorkspace.repoUrl,
+      repoRef: resolvedWorkspace.repoRef,
+    } satisfies ExecutionWorkspaceInput;
+    const reusedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
+      ? buildRealizedExecutionWorkspaceFromPersisted({
+          base: executionWorkspaceBase,
+          workspace: existingExecutionWorkspace,
+        })
+      : null;
+    const executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
+          base: executionWorkspaceBase,
+          config: runtimeConfig,
+          issue: issueRef,
+          agent: {
+            id: agent.id,
+            name: agent.name,
+            companyId: agent.companyId,
+          },
+          recorder: workspaceOperationRecorder,
+        });
+    const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
+    const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
+    let persistedExecutionWorkspace = null;
+    const nextExecutionWorkspaceMetadataBase = {
+      ...(existingExecutionWorkspace?.metadata ?? {}),
+      source: executionWorkspace.source,
+      createdByRuntime: executionWorkspace.created,
+    } as Record<string, unknown>;
+    const nextExecutionWorkspaceMetadata = shouldReuseExisting
+      ? nextExecutionWorkspaceMetadataBase
+      : configSnapshot
+        ? mergeExecutionWorkspaceConfig(nextExecutionWorkspaceMetadataBase, configSnapshot)
+        : nextExecutionWorkspaceMetadataBase;
+    try {
+      persistedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
+        ? await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
+            cwd: executionWorkspace.cwd,
+            repoUrl: executionWorkspace.repoUrl,
+            baseRef: executionWorkspace.repoRef,
+            branchName: executionWorkspace.branchName,
+            providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+            providerRef: executionWorkspace.worktreePath,
+            status: "active",
+            lastUsedAt: new Date(),
+            metadata: nextExecutionWorkspaceMetadata,
+          })
+        : resolvedProjectId
+          ? await executionWorkspacesSvc.create({
+              companyId: agent.companyId,
+              projectId: resolvedProjectId,
+              projectWorkspaceId: resolvedProjectWorkspaceId,
+              sourceIssueId: issueRef?.id ?? null,
+              mode:
+                requestedExecutionWorkspaceMode === "isolated_workspace"
+                  ? "isolated_workspace"
+                  : requestedExecutionWorkspaceMode === "operator_branch"
+                    ? "operator_branch"
+                    : requestedExecutionWorkspaceMode === "agent_default"
+                      ? "adapter_managed"
+                      : "shared_workspace",
+              strategyType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "project_primary",
+              name: executionWorkspace.branchName ?? issueRef?.identifier ?? `workspace-${agent.id.slice(0, 8)}`,
+              status: "active",
+              cwd: executionWorkspace.cwd,
+              repoUrl: executionWorkspace.repoUrl,
+              baseRef: executionWorkspace.repoRef,
+              branchName: executionWorkspace.branchName,
+              providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+              providerRef: executionWorkspace.worktreePath,
+              lastUsedAt: new Date(),
+              openedAt: new Date(),
+              metadata: nextExecutionWorkspaceMetadata,
+            })
+          : null;
+    } catch (error) {
+      if (executionWorkspace.created) {
+        try {
+          await cleanupExecutionWorkspaceArtifacts({
+            workspace: {
+              id: existingExecutionWorkspace?.id ?? `transient-${run.id}`,
+              cwd: executionWorkspace.cwd,
+              providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+              providerRef: executionWorkspace.worktreePath,
+              branchName: executionWorkspace.branchName,
+              repoUrl: executionWorkspace.repoUrl,
+              baseRef: executionWorkspace.repoRef,
+              projectId: resolvedProjectId,
+              projectWorkspaceId: resolvedProjectWorkspaceId,
+              sourceIssueId: issueRef?.id ?? null,
+              metadata: {
+                createdByRuntime: true,
+                source: executionWorkspace.source,
+              },
+            },
+            projectWorkspace: {
+              cwd: resolvedWorkspace.cwd,
+              cleanupCommand: null,
+            },
+            cleanupCommand: configSnapshot?.cleanupCommand ?? null,
+            teardownCommand: configSnapshot?.teardownCommand ?? projectExecutionWorkspacePolicy?.workspaceStrategy?.teardownCommand ?? null,
+            recorder: workspaceOperationRecorder,
+          });
+        } catch (cleanupError) {
+          logger.warn(
+            {
+              runId: run.id,
+              issueId,
+              executionWorkspaceCwd: executionWorkspace.cwd,
+              cleanupError: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            },
+            "Failed to cleanup realized execution workspace after persistence failure",
+          );
+        }
+      }
+      throw error;
+    }
+    await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
+    if (
+      existingExecutionWorkspace &&
+      persistedExecutionWorkspace &&
+      existingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
+      existingExecutionWorkspace.status === "active"
+    ) {
+      await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
+        status: "idle",
+        cleanupReason: null,
+      });
+    }
+    if (issueId && persistedExecutionWorkspace) {
+      const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
+      const shouldSwitchIssueToExistingWorkspace =
+        issueRef?.executionWorkspacePreference === "reuse_existing" ||
+        requestedExecutionWorkspaceMode === "isolated_workspace" ||
+        requestedExecutionWorkspaceMode === "operator_branch";
+      const nextIssuePatch: Record<string, unknown> = {};
+      if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
+        nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
+      }
+      if (resolvedProjectWorkspaceId && issueRef?.projectWorkspaceId !== resolvedProjectWorkspaceId) {
+        nextIssuePatch.projectWorkspaceId = resolvedProjectWorkspaceId;
+      }
+      if (shouldSwitchIssueToExistingWorkspace) {
+        nextIssuePatch.executionWorkspacePreference = "reuse_existing";
+        nextIssuePatch.executionWorkspaceSettings = {
+          ...(issueExecutionWorkspaceSettings ?? {}),
+          mode: nextIssueWorkspaceMode,
+        };
+      }
+      if (Object.keys(nextIssuePatch).length > 0) {
+        await issuesSvc.update(issueId, nextIssuePatch);
+      }
+    }
+    if (persistedExecutionWorkspace) {
+      context.executionWorkspaceId = persistedExecutionWorkspace.id;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: context,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+    }
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
       previousSessionParams,
@@ -1615,7 +2621,7 @@ export function heartbeatService(db: Db) {
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
       source: executionWorkspace.source,
-      mode: executionWorkspaceMode,
+      mode: effectiveExecutionWorkspaceMode,
       strategy: executionWorkspace.strategy,
       projectId: executionWorkspace.projectId,
       workspaceId: executionWorkspace.workspaceId,
@@ -1623,7 +2629,11 @@ export function heartbeatService(db: Db) {
       repoRef: executionWorkspace.repoRef,
       branchName: executionWorkspace.branchName,
       worktreePath: executionWorkspace.worktreePath,
-      agentHome: resolveDefaultAgentWorkspaceDir(agent.id),
+      agentHome: await (async () => {
+        const home = resolveDefaultAgentWorkspaceDir(agent.id);
+        await fs.mkdir(home, { recursive: true });
+        return home;
+      })(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     const runtimeServiceIntents = (() => {
@@ -1644,7 +2654,8 @@ export function heartbeatService(db: Db) {
     }
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     let previousSessionDisplayId = truncateDisplayId(
-      taskSessionForRun?.sessionDisplayId ??
+      explicitResumeSessionDisplayId ??
+        taskSessionForRun?.sessionDisplayId ??
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
         readNonEmptyString(runtimeSessionParams?.sessionId) ??
         runtimeSessionFallback,
@@ -1744,8 +2755,9 @@ export function heartbeatService(db: Db) {
         })
         .where(eq(heartbeatRuns.id, runId));
 
+      const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = redactCurrentUserText(chunk);
+        const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
@@ -1777,7 +2789,8 @@ export function heartbeatService(db: Db) {
         });
       };
       for (const warning of runtimeWorkspaceWarnings) {
-        await onLog("stderr", `[paperclip] ${warning}\n`);
+        const logEntry = formatRuntimeWorkspaceWarningLog(warning);
+        await onLog(logEntry.stream, logEntry.chunk);
       }
       const adapterEnv = Object.fromEntries(
         Object.entries(parseObject(resolvedConfig.env)).filter(
@@ -1794,6 +2807,7 @@ export function heartbeatService(db: Db) {
         },
         issue: issueRef,
         workspace: executionWorkspace,
+        executionWorkspaceId: persistedExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
         config: resolvedConfig,
         adapterEnv,
         onLog,
@@ -1818,7 +2832,7 @@ export function heartbeatService(db: Db) {
               workspace: executionWorkspace,
               runtimeServices,
             }),
-            { agentId: agent.id },
+            { agentId: agent.id, runId: run.id },
           );
         } catch (err) {
           await onLog(
@@ -1861,10 +2875,13 @@ export function heartbeatService(db: Db) {
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
-        config: resolvedConfig,
+        config: runtimeConfig,
         context,
         onLog,
         onMeta: onAdapterMeta,
+        onSpawn: async (meta) => {
+          await persistRunProcessMetadata(run.id, meta);
+        },
         authToken: authToken ?? undefined,
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
@@ -1905,7 +2922,7 @@ export function heartbeatService(db: Db) {
                 workspace: executionWorkspace,
                 runtimeServices: adapterManagedRuntimeServices,
               }),
-              { agentId: agent.id },
+              { agentId: agent.id, runId: run.id },
             );
           } catch (err) {
             await onLog(
@@ -1990,6 +3007,7 @@ export function heartbeatService(db: Db) {
             ? null
             : redactCurrentUserText(
                 adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                currentUserRedactionOptions,
               ),
         errorCode:
           outcome === "timed_out"
@@ -2028,6 +3046,19 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
+        if (issueId && outcome === "succeeded") {
+          try {
+            const issueComment = buildHeartbeatRunIssueComment(adapterResult.resultJson ?? null);
+            if (issueComment) {
+              await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id });
+            }
+          } catch (err) {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to post run summary comment: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          }
+        }
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
 
@@ -2057,7 +3088,10 @@ export function heartbeatService(db: Db) {
       }
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
-      const message = redactCurrentUserText(err instanceof Error ? err.message : "Unknown adapter failure");
+      const message = redactCurrentUserText(
+        err instanceof Error ? err.message : "Unknown adapter failure",
+        await getCurrentUserRedactionOptions(),
+      );
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -2245,7 +3279,9 @@ export function heartbeatService(db: Db) {
           payload: promotedPayload,
         });
 
-        const sessionBefore = await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
+        const sessionBefore =
+          readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??
+          await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
         const now = new Date();
         const newRun = await tx
           .insert(heartbeatRuns)
@@ -2324,10 +3360,30 @@ export function heartbeatService(db: Db) {
       triggerDetail,
       payload,
     });
-    const issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
+    if (explicitResumeSession) {
+      enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
+      enrichedContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
+      enrichedContextSnapshot.resumeSessionParams = explicitResumeSession.sessionParams;
+      if (!readNonEmptyString(enrichedContextSnapshot.issueId) && explicitResumeSession.issueId) {
+        enrichedContextSnapshot.issueId = explicitResumeSession.issueId;
+      }
+      if (!readNonEmptyString(enrichedContextSnapshot.taskId) && explicitResumeSession.taskId) {
+        enrichedContextSnapshot.taskId = explicitResumeSession.taskId;
+      }
+      if (!readNonEmptyString(enrichedContextSnapshot.taskKey) && explicitResumeSession.taskKey) {
+        enrichedContextSnapshot.taskKey = explicitResumeSession.taskKey;
+      }
+      issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueId;
+    }
+    const effectiveTaskKey = readNonEmptyString(enrichedContextSnapshot.taskKey) ?? taskKey;
+    const sessionBefore =
+      explicitResumeSession?.sessionDisplayId ??
+      await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
 
     const writeSkippedRequest = async (skipReason: string) => {
       await db.insert(agentWakeupRequests).values({
@@ -2391,7 +3447,6 @@ export function heartbeatService(db: Db) {
 
     if (issueId && !bypassIssueExecutionLock) {
       const agentNameKey = normalizeAgentNameKey(agent.name);
-      const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
 
       const outcome = await db.transaction(async (tx) => {
         await tx.execute(
@@ -2741,8 +3796,6 @@ export function heartbeatService(db: Db) {
       })
       .returning()
       .then((rows) => rows[0]);
-
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
 
     const newRun = await db
       .insert(heartbeatRuns)
@@ -3095,7 +4148,7 @@ export function heartbeatService(db: Db) {
         store: run.logStore,
         logRef: run.logRef,
         ...result,
-        content: redactCurrentUserText(result.content),
+        content: redactCurrentUserText(result.content, await getCurrentUserRedactionOptions()),
       };
     },
 
@@ -3115,6 +4168,8 @@ export function heartbeatService(db: Db) {
       }),
 
     wakeup: enqueueWakeup,
+
+    reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
 
